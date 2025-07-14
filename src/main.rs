@@ -11,6 +11,15 @@ use tokio::{signal, task::JoinSet};
 
 #[tokio::main]
 async fn main() {
+    // Initialize ONNX models before starting the processing pipeline
+    println!("Initializing ONNX models...");
+    if let Err(e) = core::model_manager::ensure_models_available().await {
+        eprintln!("Failed to initialize models: {}", e);
+        eprintln!("System requires ONNX models to function. Exiting...");
+        return;
+    }
+    println!("ONNX models initialized successfully.");
+    
     let signals = Arc::new(JarvisSignals::new());
     let mut thread_pool = JoinSet::new();
 

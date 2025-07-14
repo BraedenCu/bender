@@ -1,5 +1,5 @@
 [package]
-name = "jarvis"
+name = "bender"
 version = "0.1.0"
 edition = "2021"
 
@@ -17,11 +17,18 @@ whisper-rs = "0.11.1"
 cpal = "0.15.3"
 rodio = "0.18.0"
 hound = "3.5.1"
-tokio = { version = "1.38.0", features = ["full"] }
+tokio = { version = "1.38.0", features = ["full", "rt-multi-thread"] }
 tokio-macros = "2.2"
 bytes = "1.6"
 rust_tokenizers = "8.1.1"
-rust-bert = { git = "https://github.com/guillaume-be/rust-bert", rev = "f99bf51f532d6d2ef5dfb05e21c536897888afd4" }
-tch = "0.15.0"
+ort = "2.0.0-rc.10"
+tokenizers = "0.20.4"
 rand = "0.8.0"
 anyhow = "1.0.68"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.11", features = ["json", "stream"] }
+futures-util = "0.3"
+sha2 = "0.10"
+hex = "0.4"
+ndarray = "0.15"

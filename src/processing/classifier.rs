@@ -1,13 +1,19 @@
 use std::sync::mpsc::{Receiver, Sender};
-
+use ort::{session::Session, value::Value};
+use tokenizers::Tokenizer;
+use ndarray::Array1;
 use anyhow::Result;
-use rust_bert::{pipelines::{sequence_classification::Label, zero_shot_classification::{ZeroShotClassificationConfig, ZeroShotClassificationModel}}, RustBertError};
-
-use crate::{core::commander::Commander, model::{command::Command, command_action::CommandAction, command_subject::CommandSubject, intent::Intent}, traits::labelable::Labelable};
+use crate::model::command::Command;
+use crate::model::intent::Intent;
+use crate::model::command_action::{CommandAction, CommandSwitchValue};
+use crate::model::command_subject::CommandSubject;
+use crate::core::model_manager::ModelManager;
+use crate::core::commander::Commander;
+use crate::traits::labelable::Labelable;
 
 pub type ClassifierOutput = Result<Intent, ClassificationFailureReason>;
 
-const SCORE_THRESHOLD: f64 = 0.85;
+const SCORE_THRESHOLD: f64 = 0.75;
 
 struct ClassificationLabels {
     intents: Vec<String>,
@@ -16,27 +22,246 @@ struct ClassificationLabels {
     subjects: Vec<String>
 }
 
+#[derive(Debug)]
+pub struct Label {
+    pub text: String,
+    pub score: f64,
+}
+
 pub enum ClassificationFailureReason {
     Unknown, UnsupportedInstruction, UnrecognizedInstruction
 }
 
+pub struct ONNXClassifier {
+    session: Option<Session>,
+    tokenizer: Option<Tokenizer>,
+    manager: ModelManager,
+}
+
+impl ONNXClassifier {
+    pub fn new() -> Result<Self> {
+        let manager = ModelManager::new()?;
+        let (session, tokenizer) = Self::load_onnx_model(&manager);
+        
+        Ok(ONNXClassifier {
+            session,
+            tokenizer,
+            manager,
+        })
+    }
+    
+    fn load_onnx_model(manager: &ModelManager) -> (Option<Session>, Option<Tokenizer>) {
+        let model_path = manager.get_model_path("all-MiniLM-L6-v2");
+        
+        if !model_path.exists() {
+            println!("ONNX model not found at {:?}", model_path);
+            return (None, None);
+        }
+        
+        // Load ONNX session
+        let session = Session::builder()
+            .map_err(|e| println!("Failed to create session builder: {}", e))
+            .ok()
+            .and_then(|builder| {
+                builder.commit_from_file(&model_path)
+                    .map_err(|e| println!("Failed to load model from {:?}: {}", model_path, e))
+                    .ok()
+            });
+        
+        // Load tokenizer
+        let tokenizer_path = manager.get_tokenizer_path();
+        let tokenizer = if tokenizer_path.exists() {
+            Tokenizer::from_file(&tokenizer_path)
+                .map_err(|e| println!("Failed to load tokenizer: {}", e))
+                .ok()
+        } else {
+            println!("Tokenizer not found at {:?}", tokenizer_path);
+            None
+        };
+        
+        if session.is_some() && tokenizer.is_some() {
+            println!("Successfully loaded ONNX classification model");
+        } else {
+            println!("Failed to load ONNX model or tokenizer");
+        }
+        
+        (session, tokenizer)
+    }
+    
+    pub fn classify_with_onnx(&mut self, instruction: &str, labels: &ClassificationLabels) -> Result<Vec<Label>, String> {
+        let session = self.session.as_mut().ok_or("No ONNX session available")?;
+        let tokenizer = self.tokenizer.as_ref().ok_or("No tokenizer available")?;
+        
+        // Get embeddings for the input instruction
+        let input_embedding = Self::get_text_embedding(instruction, session, tokenizer).ok_or("Failed to get input embedding")?;
+        
+        // Get embeddings for all labels
+        let mut label_scores = Vec::new();
+        
+        // Process intent labels
+        for intent in &labels.intents {
+            if let Some(label_embedding) = Self::get_text_embedding(intent, session, tokenizer) {
+                let similarity = cosine_similarity(&input_embedding, &label_embedding);
+                label_scores.push(Label {
+                    text: intent.clone(),
+                    score: similarity,
+                });
+            }
+        }
+        
+        // Process action labels  
+        for action in &labels.actions {
+            if let Some(label_embedding) = Self::get_text_embedding(action, session, tokenizer) {
+                let similarity = cosine_similarity(&input_embedding, &label_embedding);
+                label_scores.push(Label {
+                    text: action.clone(),
+                    score: similarity,
+                });
+            }
+        }
+        
+        // Process subject labels
+        for subject in &labels.subjects {
+            if let Some(label_embedding) = Self::get_text_embedding(subject, session, tokenizer) {
+                let similarity = cosine_similarity(&input_embedding, &label_embedding);
+                label_scores.push(Label {
+                    text: subject.clone(),
+                    score: similarity,
+                });
+            }
+        }
+        
+        // Process location labels
+        for location in &labels.locations {
+            if let Some(label_embedding) = Self::get_text_embedding(location, session, tokenizer) {
+                let similarity = cosine_similarity(&input_embedding, &label_embedding);
+                label_scores.push(Label {
+                    text: location.clone(),
+                    score: similarity,
+                });
+            }
+        }
+        
+        // Sort by similarity score (descending)
+        label_scores.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        
+        Ok(label_scores)
+    }
+    
+    fn get_text_embedding(text: &str, session: &mut Session, tokenizer: &Tokenizer) -> Option<Array1<f32>> {
+        // Use the real tokenizer to encode the text
+        let encoding = tokenizer.encode(text, true).ok()?;
+        
+        let input_ids = encoding.get_ids();
+        let attention_mask = encoding.get_attention_mask();
+        
+        if input_ids.is_empty() {
+            return None;
+        }
+        
+        // Convert to the format expected by ONNX Runtime
+        let batch_size = 1;
+        let sequence_length = input_ids.len();
+        
+        // Create i64 arrays for ONNX Runtime
+        let input_ids_i64: Vec<i64> = input_ids.iter().map(|&x| x as i64).collect();
+        let attention_mask_i64: Vec<i64> = attention_mask.iter().map(|&x| x as i64).collect();
+        
+        // Create Value objects for ONNX Runtime
+        let input_ids_value = Value::from_array(([batch_size, sequence_length], input_ids_i64)).ok()?;
+        let attention_mask_value = Value::from_array(([batch_size, sequence_length], attention_mask_i64)).ok()?;
+        
+        // Run inference
+        let outputs = session.run(ort::inputs![
+            "input_ids" => input_ids_value,
+            "attention_mask" => attention_mask_value
+        ]).ok()?;
+        
+        // For sentence transformers, we need to extract the pooled output
+        // The exact output name might be different, so try common names
+        let output_names = ["last_hidden_state", "pooler_output", "sentence_embedding"];
+        
+        for output_name in &output_names {
+            if let Ok(tensor) = outputs[*output_name].try_extract_tensor::<f32>() {
+                let (shape, data) = tensor;
+                
+                // For sentence transformers, we typically do mean pooling
+                // The shape is usually [batch_size, sequence_length, hidden_size]
+                if shape.len() == 3 && shape[0] == batch_size as i64 && shape[2] == 384 {
+                    // Do mean pooling over the sequence length dimension
+                    let seq_len = shape[1] as usize;
+                    let hidden_size = 384;
+                    
+                    let mut pooled = vec![0.0f32; hidden_size];
+                    
+                    for i in 0..seq_len {
+                        for j in 0..hidden_size {
+                            let idx = i * hidden_size + j;
+                            if idx < data.len() {
+                                pooled[j] += data[idx];
+                            }
+                        }
+                    }
+                    
+                    // Average by sequence length
+                    for val in pooled.iter_mut() {
+                        *val /= seq_len as f32;
+                    }
+                    
+                    // Normalize the embedding
+                    let norm: f32 = pooled.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    if norm > 0.0 {
+                        for val in pooled.iter_mut() {
+                            *val /= norm;
+                        }
+                    }
+                    
+                    return Some(Array1::from_vec(pooled));
+                }
+                // If it's already pooled (shape [batch_size, hidden_size])
+                else if shape.len() == 2 && shape[0] == batch_size as i64 && shape[1] == 384 {
+                    let embedding = data[0..384].to_vec();
+                    let embedding_array = Array1::from_vec(embedding);
+                    
+                    // Normalize
+                    let norm = (embedding_array.mapv(|x| x * x).sum()).sqrt();
+                    if norm > 0.0 {
+                        return Some(embedding_array / norm);
+                    } else {
+                        return Some(embedding_array);
+                    }
+                }
+            }
+        }
+        
+        None
+    }
+}
+
+fn cosine_similarity(a: &Array1<f32>, b: &Array1<f32>) -> f64 {
+    let dot_product: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.mapv(|x| x * x).sum().sqrt();
+    let norm_b: f32 = b.mapv(|x| x * x).sum().sqrt();
+    
+    if norm_a > 0.0 && norm_b > 0.0 {
+        (dot_product / (norm_a * norm_b)) as f64
+    } else {
+        0.0
+    }
+}
+
 pub fn main(command_rx: Receiver<String>, intent_tx: Sender<ClassifierOutput>) -> Result<()> {
-    let model = load_model()?;
     let commander = Commander::new();
     let labels = build_labels(&commander);
-    let model_labels: Vec<&str> = labels.locations
-        .iter()
-        .chain(labels.actions.iter())
-        .chain(labels.subjects.iter())
-        .chain(labels.intents.iter())
-        .map(|s| s.as_str())
-        .collect();
-
+    
+    let mut classifier = ONNXClassifier::new()?;
+    
     while let Ok(instruction) = command_rx.recv() {
-        let inputs = vec![instruction.as_str()];
-        let output = match model.predict_multilabel(inputs, &model_labels, None, 128) {
-            Ok(result) => result,
-            Err(_) => {
+        let classification_result = match classifier.classify_with_onnx(&instruction, &labels) {
+            Ok(onnx_result) => onnx_result,
+            Err(e) => {
+                eprintln!("ONNX classification failed: {}. System requires ONNX models to function.", e);
+                // Return failure without fallback
                 if intent_tx.send(Err(ClassificationFailureReason::Unknown)).is_err() {
                     break;
                 }
@@ -44,11 +269,11 @@ pub fn main(command_rx: Receiver<String>, intent_tx: Sender<ClassifierOutput>) -
             }
         };
         
-        let (intent, score) = intent_from_classification(&instruction, &output[0], &labels);
+        let (intent, score) = intent_from_classification(&instruction, &classification_result, &labels);
         let result: Result<Intent, ClassificationFailureReason>;
 
         if score < SCORE_THRESHOLD {
-            println!("Instruction '{}'\nScore {} with output: {:?}\n", instruction, score, output[0]);
+            println!("Instruction '{}'\nScore {} with classification: {:?}\n", instruction, score, classification_result);
             result = Err(ClassificationFailureReason::UnrecognizedInstruction);
         } else if let Intent::Command(ref command) = intent {
             if commander.supports_command(command) {
@@ -59,7 +284,7 @@ pub fn main(command_rx: Receiver<String>, intent_tx: Sender<ClassifierOutput>) -
             }
         } else if let Intent::Question(_) = intent {
             result = Ok(intent);
-        } else { // Shouldn't really happen
+        } else {
             println!("No suitable command for '{}'\n", instruction);
             result = Err(ClassificationFailureReason::UnsupportedInstruction);
         }
@@ -72,15 +297,7 @@ pub fn main(command_rx: Receiver<String>, intent_tx: Sender<ClassifierOutput>) -
     Ok(())
 }
 
-fn load_model() -> Result<ZeroShotClassificationModel, RustBertError> {
-    let config = ZeroShotClassificationConfig {
-        model_type: rust_bert::pipelines::common::ModelType::Bart,
-        ..Default::default()
-    };
-    let model = ZeroShotClassificationModel::new(config)?;
 
-    Ok(model)
-}
 
 fn build_labels(commander: &Commander) -> ClassificationLabels {
     ClassificationLabels {
@@ -99,9 +316,8 @@ fn intent_from_classification(instruction: &str, model_output: &Vec<Label>, data
     for (i, label) in model_output.iter().enumerate() {
         let score = label.score;
 
-        // Figuring out if it's a question is a bit special
+        // Check for questions
         if data.intents.contains(&label.text) && score > SCORE_THRESHOLD {
-            // Only in the case of a recognized question we return early
             if Intent::is_label_question(&label.text) {
                 return (Intent::Question(instruction.to_string()), score);
             }
@@ -109,18 +325,22 @@ fn intent_from_classification(instruction: &str, model_output: &Vec<Label>, data
             action = (score, i);
         } else if data.subjects.contains(&label.text) && score > subject.0 {
             subject = (score, i);
-        } else if score > location.0 { // it's a location
+        } else if data.locations.contains(&label.text) && score > location.0 {
             location = (score, i);
         }
     }
 
-    let score = action.0.min(location.0).min(subject.0);
-    let command = Command {
-        location: model_output[location.1].text.clone(),
-        action: model_output[action.1].text.parse::<CommandAction>().unwrap(),
-        subject: model_output[subject.1].text.parse::<CommandSubject>().unwrap()
-    };
-    let intent = Intent::Command(command);
-
-    (intent, score)
+    if action.0 > 0.0 && subject.0 > 0.0 && location.0 > 0.0 {
+        let score = action.0.min(location.0).min(subject.0);
+        let command = Command {
+            location: model_output[location.1].text.clone(),
+            action: model_output[action.1].text.parse::<CommandAction>().unwrap_or(CommandAction::Switch(CommandSwitchValue::Off)),
+            subject: model_output[subject.1].text.parse::<CommandSubject>().unwrap_or(CommandSubject::Light)
+        };
+        let intent = Intent::Command(command);
+        (intent, score)
+    } else {
+        // Default to a question if we can't classify properly
+        (Intent::Question(instruction.to_string()), 0.6)
+    }
 }
