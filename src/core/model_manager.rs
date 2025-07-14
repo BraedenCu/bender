@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::fs;
-use anyhow::{Result, Context, anyhow};
+use anyhow::{Result, anyhow};
 use reqwest;
 use futures_util::StreamExt;
 use sha2::{Sha256, Digest};
@@ -73,6 +73,7 @@ impl ModelManager {
                 }
                 Err(e) => {
                     println!("Failed to download text generation model: {}", e);
+                    self.check_manual_model_placement().ok();
                 }
             }
         } else {
@@ -86,7 +87,7 @@ impl ModelManager {
         }
         
         if !text_generation_available {
-            println!("Text generation model not available - responses will be limited");
+            println!("Text generation model not available - system will use classification-based responses");
         }
         
         println!("ONNX models initialization complete!");
@@ -179,12 +180,30 @@ impl ModelManager {
     
     pub fn get_text_generation_model_info() -> ModelInfo {
         ModelInfo {
-            name: "gpt2-small".to_string(),
-            url: "https://huggingface.co/openai-community/gpt2/resolve/main/onnx/model.onnx".to_string(),
+            name: "decoder_model".to_string(),
+            url: "https://huggingface.co/optimum/gpt2/resolve/main/onnx/decoder_model.onnx".to_string(),
             sha256: "".to_string(), // We'll skip verification for now
-            size_mb: 125.0,
+            size_mb: 500.0, // GPT-2 model size
             description: "GPT-2 ONNX model for conversational text generation".to_string(),
         }
+    }
+
+    /// Support for manually placed models
+    pub fn check_manual_model_placement(&self) -> Result<()> {
+        let text_gen_model = Self::get_text_generation_model_info();
+        let model_path = self.get_model_path(&text_gen_model.name);
+        
+        if !model_path.exists() {
+            println!("\n📋 MANUAL MODEL DOWNLOAD INSTRUCTIONS:");
+            println!("   If automatic download fails, you can manually download the text generation model:");
+            println!("   1. Go to: https://huggingface.co/optimum/gpt2");
+            println!("   2. Download: onnx/decoder_model.onnx");
+            println!("   3. Place it at: {:?}", model_path);
+            println!("   4. Restart the application\n");
+            println!("   Alternative: You can place any compatible ONNX text generation model in the models/ directory");
+        }
+        
+        Ok(())
     }
 }
 

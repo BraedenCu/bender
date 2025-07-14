@@ -1,7 +1,7 @@
 use std::sync::mpsc::{Receiver, Sender};
 use anyhow::Result;
 use ort::{session::Session, value::Value};
-use ndarray::Array2;
+use tokenizers::Tokenizer;
 
 use crate::{
     core::model_manager::ModelManager,
@@ -13,17 +13,42 @@ use super::classifier::ClassificationFailureReason;
 pub struct ONNXTextGenerator {
     session: Option<Session>,
     manager: ModelManager,
+    tokenizer: Option<Tokenizer>,
 }
 
 impl ONNXTextGenerator {
     pub fn new() -> Result<Self> {
         let manager = ModelManager::new()?;
         let session = Self::load_onnx_model(&manager);
+        let tokenizer = Self::load_tokenizer(&manager);
+        
+        println!("DEBUG: ONNXTextGenerator::new() - tokenizer loaded: {}", tokenizer.is_some());
         
         Ok(ONNXTextGenerator {
             session,
             manager,
+            tokenizer,
         })
+    }
+    
+    fn load_tokenizer(manager: &ModelManager) -> Option<Tokenizer> {
+        let tokenizer_path = manager.get_tokenizer_path();
+        
+        if !tokenizer_path.exists() {
+            println!("Tokenizer not found at: {}", tokenizer_path.display());
+            return None;
+        }
+        
+        match Tokenizer::from_file(&tokenizer_path) {
+            Ok(tokenizer) => {
+                println!("Successfully loaded tokenizer from: {}", tokenizer_path.display());
+                Some(tokenizer)
+            }
+            Err(e) => {
+                eprintln!("Failed to load tokenizer: {}", e);
+                None
+            }
+        }
     }
     
     fn load_onnx_model(manager: &ModelManager) -> Option<Session> {
@@ -31,7 +56,7 @@ impl ONNXTextGenerator {
         let model_path = manager.get_model_path(&model_info.name);
         
         if !model_path.exists() {
-            println!("ONNX text generation model not found, system requires models to function");
+            println!("ONNX text generation model not found, will use classification-based responses");
             return None;
         }
         
@@ -41,116 +66,179 @@ impl ONNXTextGenerator {
         {
             Ok(session) => {
                 println!("Successfully loaded ONNX text generation model");
+                
+                // DEBUG: Print model input/output info
+                println!("DEBUG: Text gen model inputs: {:?}", session.inputs.iter().map(|i| &i.name).collect::<Vec<_>>());
+                println!("DEBUG: Text gen model outputs: {:?}", session.outputs.iter().map(|o| &o.name).collect::<Vec<_>>());
+                
                 Some(session)
             }
             Err(e) => {
-                eprintln!("Failed to load ONNX text generation model: {}, system requires models to function", e);
+                eprintln!("Failed to load ONNX text generation model: {}, will use classification-based responses", e);
                 None
             }
         }
     }
     
     pub fn generate_with_onnx(&mut self, question: &str) -> Result<String, String> {
-        let session = self.session.as_mut().ok_or("No ONNX text generation session available. System requires ONNX models to function.")?;
+        println!("DEBUG: generate_with_onnx called with: '{}'", question);
         
-        // Create a simple prompt for GPT-2
-        let prompt = format!("Human: {}\nAssistant:", question.trim());
+        // First check if we have both session and tokenizer
+        println!("DEBUG: session available: {}", self.session.is_some());
+        println!("DEBUG: tokenizer available: {}", self.tokenizer.is_some());
         
-        // Simple tokenization for GPT-2
-        let tokens = Self::simple_tokenize(&prompt);
+        if self.session.is_none() {
+            return Err("No ONNX text generation session available".to_string());
+        }
+        if self.tokenizer.is_none() {
+            return Err("No tokenizer available".to_string());
+        }
         
-        // Generate response
-        let generated_tokens = Self::generate_tokens(session, &tokens, 30).ok_or("Failed to generate tokens with ONNX model")?;
+        println!("DEBUG: Session and tokenizer available, starting tokenization");
+        let input_tokens = {
+            let tokenizer = self.tokenizer.as_ref().unwrap();
+            Self::tokenize_with_tokenizer(question, tokenizer)?
+        };
+        println!("DEBUG: Input tokens: {:?}", input_tokens);
         
-        // Convert back to text
-        let response = Self::detokenize(&generated_tokens);
+        if input_tokens.is_empty() {
+            return Err("Failed to tokenize input".to_string());
+        }
         
-        // Clean up response
+        println!("DEBUG: Calling generate_tokens");
+        let generated_tokens = {
+            let session = self.session.as_mut().unwrap();
+            Self::generate_tokens(session, &input_tokens, 20)  // Reduced from 50 to 20
+                .ok_or("Failed to generate tokens with ONNX model")?
+        };
+        
+        println!("DEBUG: Generated {} tokens: {:?}", generated_tokens.len(), generated_tokens);
+        let response = {
+            let tokenizer = self.tokenizer.as_ref().unwrap();
+            Self::detokenize_with_tokenizer(&generated_tokens, tokenizer)?
+        };
         let cleaned_response = Self::clean_response(&response, question);
         
-        println!("ONNX generated response for '{}': '{}'", question, cleaned_response);
-        
+        println!("DEBUG: Final response: '{}'", cleaned_response);
         Ok(cleaned_response)
     }
     
-    fn simple_tokenize(text: &str) -> Vec<i32> {
-        // Very basic tokenization for GPT-2
-        let words: Vec<&str> = text.split_whitespace().collect();
-        let mut tokens = vec![50256]; // GPT-2 BOS token
+    fn tokenize_with_tokenizer(text: &str, tokenizer: &Tokenizer) -> Result<Vec<i32>, String> {
+        let encoding = tokenizer.encode(text, false)
+            .map_err(|e| format!("Failed to encode text: {}", e))?;
         
-        for word in words {
-            // Simple hash-based token ID generation (not proper tokenization)
-            let token_id = (word.chars().map(|c| c as u32).sum::<u32>() % 50000) as i32 + 100;
-            tokens.push(token_id);
-        }
+        let tokens: Vec<i32> = encoding.get_ids().iter().map(|&id| id as i32).collect();
+        println!("DEBUG: Tokenized '{}' to {} tokens: {:?}", text, tokens.len(), &tokens[..tokens.len().min(10)]);
         
-        tokens
+        Ok(tokens)
+    }
+    
+    fn detokenize_with_tokenizer(tokens: &[i32], tokenizer: &Tokenizer) -> Result<String, String> {
+        let token_ids: Vec<u32> = tokens.iter().map(|&id| id as u32).collect();
+        
+        let decoded = tokenizer.decode(&token_ids, true)
+            .map_err(|e| format!("Failed to decode tokens: {}", e))?;
+        
+        println!("DEBUG: Detokenized {} tokens to: '{}'", tokens.len(), decoded);
+        Ok(decoded)
     }
     
     fn generate_tokens(session: &mut Session, input_tokens: &[i32], max_new_tokens: usize) -> Option<Vec<i32>> {
-        let mut current_tokens = input_tokens.to_vec();
-        let mut generated_tokens = Vec::new();
+        println!("DEBUG: generate_tokens called with {} input tokens, max_new_tokens: {}", input_tokens.len(), max_new_tokens);
         
-        for _ in 0..max_new_tokens {
-            // Prepare input for the model (use last 512 tokens as context)
-            let context_length = current_tokens.len().min(512);
-            let input_slice = &current_tokens[current_tokens.len() - context_length..];
+        // Use only the actual input tokens, no padding
+        let mut tokens = input_tokens.to_vec();
+        
+        for i in 0..max_new_tokens {
+            if i % 10 == 0 {  // Reduce debug spam
+                println!("DEBUG: Generation step {}/{}", i + 1, max_new_tokens);
+            }
             
-            // Create input array for ONNX
-            let input_ids = Array2::from_shape_vec((1, input_slice.len()), input_slice.to_vec()).ok()?;
-            let input_ids_i64 = input_ids.mapv(|x| x as i64);
-            let shape = input_ids_i64.shape().to_vec();
-            let raw_data = input_ids_i64.into_raw_vec();
+            // Prepare input for the model
+            let input_ids: Vec<i64> = tokens.iter().map(|&x| x as i64).collect();
+            let batch_size = 1;
+            let seq_len = input_ids.len();
             
-            // Create input value for ONNX
-            let input_value = Value::from_array(([shape[0], shape[1]], raw_data)).ok()?;
+            // Create attention_mask (all 1s for no padding)
+            let attention_mask: Vec<i64> = vec![1i64; seq_len];
             
-            // Run inference with standard input name
-            let outputs = session.run(ort::inputs!["input_ids" => input_value]).ok()?;
+            // Create ONNX inputs
+            let input_ids_value = Value::from_array(([batch_size, seq_len], input_ids)).ok()?;
+            let attention_mask_value = Value::from_array(([batch_size, seq_len], attention_mask)).ok()?;
             
-            // Try to get logits from different possible output names
-            let output_names = ["logits", "output", "outputs", "last_hidden_state"];
-            
-            for output_name in &output_names {
-                if let Ok(logits_tensor) = outputs[*output_name].try_extract_tensor::<f32>() {
-                    let (_shape, data) = logits_tensor;
-                    
-                    // Sample next token from the last position
-                    if data.len() >= 50000 { // GPT-2 vocab size ~50k
-                        let vocab_size = 50000;
-                        let last_logits_start = data.len() - vocab_size;
-                        let last_logits_slice = &data[last_logits_start..];
-                        
-                        let next_token = Self::sample_token(last_logits_slice);
-                        
-                        // Check for GPT-2 end tokens
-                        if next_token == 50256 || next_token == 0 { // EOS or PAD tokens
-                            break;
-                        }
-                        
-                        generated_tokens.push(next_token);
-                        current_tokens.push(next_token);
-                        break;
-                    }
+            // Run the model
+            let outputs = match session.run(ort::inputs![
+                "input_ids" => input_ids_value,
+                "attention_mask" => attention_mask_value
+            ]) {
+                Ok(outputs) => outputs,
+                Err(e) => {
+                    println!("DEBUG: ONNX text generation inference failed with error: {}", e);
+                    return None;
                 }
+            };
+            
+            // Get the logits from the output
+            // The output should be logits with shape [batch_size, sequence_length, vocab_size]
+            if let Ok(logits_tensor) = outputs["logits"].try_extract_tensor::<f32>() {
+                let (_shape, logits_data) = logits_tensor;
+                
+                // Get the logits for the last token
+                let vocab_size = 50257; // GPT-2 vocab size
+                let last_token_logits_start = logits_data.len() - vocab_size;
+                let last_token_logits = &logits_data[last_token_logits_start..];
+                
+                // Sample the next token
+                let next_token = Self::sample_token(last_token_logits);
+                
+                tokens.push(next_token);
+                
+                // Stop if we hit the end token (50256 for GPT-2)
+                if next_token == 50256 {
+                    println!("DEBUG: Hit end token, stopping generation");
+                    break;
+                }
+                
+                // Also stop if we hit certain other stop conditions
+                if next_token == 0 || (i > 5 && next_token == tokens[tokens.len()-2]) {
+                    println!("DEBUG: Hit stop condition, stopping generation");
+                    break;
+                }
+            } else {
+                println!("DEBUG: Failed to extract logits tensor");
+                break;
             }
         }
         
-        Some(generated_tokens)
+        println!("DEBUG: Generation complete, total tokens: {}", tokens.len());
+        Some(tokens)
     }
     
     fn sample_token(logits: &[f32]) -> i32 {
-        // Simple sampling: find the most likely token with some randomness
-        let temperature = 0.7;
+        // Improved sampling to avoid invalid tokens
+        let temperature = 0.8;
         
         // Apply temperature
         let scaled_logits: Vec<f32> = logits.iter().map(|&x| x / temperature).collect();
         
-        // Find top-k tokens
-        let top_k = 50;
-        let mut indexed_logits: Vec<(usize, f32)> = scaled_logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+        // Find top-k tokens, filtering out potentially problematic ones
+        let top_k = 40;
+        let mut indexed_logits: Vec<(usize, f32)> = scaled_logits.iter().enumerate()
+            .filter(|(i, _)| {
+                // Filter out some potentially problematic token ranges
+                let token_id = *i;
+                // GPT-2 vocabulary: avoid very high token IDs that might be unused
+                token_id < 50000 && token_id > 3  // Avoid very low tokens (padding, etc.)
+            })
+            .map(|(i, &v)| (i, v))
+            .collect();
+        
         indexed_logits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         indexed_logits.truncate(top_k);
+        
+        if indexed_logits.is_empty() {
+            return 50256; // GPT-2 end token as fallback
+        }
         
         // Convert to probabilities
         let max_logit = indexed_logits[0].1;
@@ -180,21 +268,25 @@ impl ONNXTextGenerator {
         indexed_logits[0].0 as i32
     }
     
-    fn detokenize(tokens: &[i32]) -> String {
-        // Very basic detokenization - should use proper Llama tokenizer
-        let words: Vec<String> = tokens.iter().map(|&token_id| {
-            format!("token{}", token_id % 1000)
-        }).collect();
-        
-        words.join(" ")
-    }
-    
     fn clean_response(response: &str, _question: &str) -> String {
         // Clean up the generated response
         let mut cleaned = response.trim().to_string();
         
-        // Remove "token" prefixes from our simple detokenizer
-        cleaned = cleaned.replace("token", " ");
+        // Remove any remaining control characters or unwanted tokens
+        cleaned = cleaned.replace("<|endoftext|>", "");
+        cleaned = cleaned.replace("<|startoftext|>", "");
+        
+        // Remove various unwanted artifacts
+        cleaned = cleaned.replace("[unused", "");
+        cleaned = cleaned.replace("unused]", "");
+        cleaned = cleaned.replace("[PAD]", "");
+        cleaned = cleaned.replace("[UNK]", "");
+        
+        // Remove excessive whitespace and clean up
+        cleaned = cleaned.split_whitespace()
+            .filter(|word| !word.contains("unused") && !word.contains('[') && !word.contains(']'))
+            .collect::<Vec<_>>()
+            .join(" ");
         
         // Basic cleanup
         cleaned = cleaned.trim().to_string();
@@ -204,9 +296,9 @@ impl ONNXTextGenerator {
             cleaned.push('.');
         }
         
-        // If response is too short or nonsensical, indicate model limitation
-        if cleaned.len() < 10 {
-            "I need a proper tokenizer to generate better responses.".to_string()
+        // If response is too short or empty, provide a basic response
+        if cleaned.len() < 3 {
+            "I understand your request.".to_string()
         } else {
             cleaned
         }
@@ -233,34 +325,71 @@ pub fn main(intent_rx: Receiver<Result<Intent, ClassificationFailureReason>>, fe
 
 fn generate_onnx_error_response(reason: ClassificationFailureReason, text_generator: &mut ONNXTextGenerator) -> String {
     let error_prompt = match reason {
-        ClassificationFailureReason::UnsupportedInstruction => "I don't understand what you're asking me to do",
-        ClassificationFailureReason::UnrecognizedInstruction => "I didn't recognize your request",
-        ClassificationFailureReason::Unknown => "Something went wrong processing your request",
+        ClassificationFailureReason::UnsupportedInstruction => "Assistant: I apologize, but I don't understand what you're asking me to do. Could you please rephrase your request?",
+        ClassificationFailureReason::UnrecognizedInstruction => "Assistant: I'm sorry, I didn't recognize your request. How can I help you today?",
+        ClassificationFailureReason::Unknown => "Assistant: I apologize, but something went wrong processing your request. Please try again.",
     };
     
     match text_generator.generate_with_onnx(error_prompt) {
-        Ok(response) => response,
+        Ok(response) => {
+            // Clean up the response to remove "Assistant:" prefix if present
+            let cleaned = response.strip_prefix("Assistant:").unwrap_or(&response).trim();
+            cleaned.to_string()
+        },
         Err(e) => {
-            eprintln!("ONNX text generation failed: {}. System requires ONNX models to function.", e);
-            "I cannot respond because the required ONNX models are not available.".to_string()
+            eprintln!("ONNX text generation failed: {}. Using basic error response.", e);
+            match reason {
+                ClassificationFailureReason::UnsupportedInstruction => "I don't understand what you're asking me to do.".to_string(),
+                ClassificationFailureReason::UnrecognizedInstruction => "I didn't recognize your request.".to_string(),
+                ClassificationFailureReason::Unknown => "Something went wrong processing your request.".to_string(),
+            }
         }
     }
 }
 
 fn generate_onnx_response(intent: Intent, text_generator: &mut ONNXTextGenerator) -> String {
     let prompt = match intent {
-        Intent::Command(ref command) => format!("I need to {} the {} in the {}", 
+        Intent::Command(ref command) => format!("Human: Please {} the {} in the {}\nAssistant: I'll help you with that.", 
             command.action.to_string(), 
             command.subject.to_string(), 
             command.location),
-        Intent::Question(question) => question,
+        Intent::Question(ref question) => format!("Human: {}\nAssistant: Let me help you with that.", question),
     };
     
     match text_generator.generate_with_onnx(&prompt) {
-        Ok(response) => response,
+        Ok(response) => {
+            // Clean up the response
+            let cleaned = response.strip_prefix("Human:")
+                .or_else(|| response.strip_prefix("Assistant:"))
+                .unwrap_or(&response)
+                .trim();
+            
+            // Remove any duplicate conversation markers
+            let cleaned = cleaned.replace("Human:", "")
+                .replace("Assistant:", "")
+                .trim()
+                .to_string();
+            
+            if cleaned.is_empty() {
+                "I understand your request.".to_string()
+            } else {
+                cleaned
+            }
+        },
         Err(e) => {
-            eprintln!("ONNX text generation failed: {}. System requires ONNX models to function.", e);
-            "I cannot respond because the required ONNX models are not available.".to_string()
+            eprintln!("ONNX text generation failed: {}. Using classification-based response.", e);
+            // Provide a basic response based on the intent
+            match intent {
+                Intent::Command(ref command) => {
+                    format!("I understand you want to {} the {} in the {}.", 
+                        command.action.to_string(), 
+                        command.subject.to_string(), 
+                        command.location)
+                },
+                Intent::Question(ref question) => {
+                    format!("I received your question about: {}.", question)
+                }
+            }
         }
     }
 }

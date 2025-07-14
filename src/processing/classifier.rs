@@ -81,6 +81,12 @@ impl ONNXClassifier {
         
         if session.is_some() && tokenizer.is_some() {
             println!("Successfully loaded ONNX classification model");
+            
+            // DEBUG: Print model input/output info
+            if let Some(ref sess) = session {
+                println!("DEBUG: Model inputs: {:?}", sess.inputs.iter().map(|i| &i.name).collect::<Vec<_>>());
+                println!("DEBUG: Model outputs: {:?}", sess.outputs.iter().map(|o| &o.name).collect::<Vec<_>>());
+            }
         } else {
             println!("Failed to load ONNX model or tokenizer");
         }
@@ -149,13 +155,18 @@ impl ONNXClassifier {
     }
     
     fn get_text_embedding(text: &str, session: &mut Session, tokenizer: &Tokenizer) -> Option<Array1<f32>> {
+        println!("DEBUG: Starting get_text_embedding for text: '{}'", text);
+        
         // Use the real tokenizer to encode the text
         let encoding = tokenizer.encode(text, true).ok()?;
         
         let input_ids = encoding.get_ids();
         let attention_mask = encoding.get_attention_mask();
         
+        println!("DEBUG: Tokenized - input_ids len: {}, attention_mask len: {}", input_ids.len(), attention_mask.len());
+        
         if input_ids.is_empty() {
+            println!("DEBUG: Empty input_ids, returning None");
             return None;
         }
         
@@ -166,24 +177,43 @@ impl ONNXClassifier {
         // Create i64 arrays for ONNX Runtime
         let input_ids_i64: Vec<i64> = input_ids.iter().map(|&x| x as i64).collect();
         let attention_mask_i64: Vec<i64> = attention_mask.iter().map(|&x| x as i64).collect();
+        // Create token_type_ids (all zeros for single sentence)
+        let token_type_ids_i64: Vec<i64> = vec![0i64; sequence_length];
         
         // Create Value objects for ONNX Runtime
         let input_ids_value = Value::from_array(([batch_size, sequence_length], input_ids_i64)).ok()?;
         let attention_mask_value = Value::from_array(([batch_size, sequence_length], attention_mask_i64)).ok()?;
+        let token_type_ids_value = Value::from_array(([batch_size, sequence_length], token_type_ids_i64)).ok()?;
         
         // Run inference
-        let outputs = session.run(ort::inputs![
+        println!("DEBUG: About to run ONNX session inference...");
+        let outputs = match session.run(ort::inputs![
             "input_ids" => input_ids_value,
-            "attention_mask" => attention_mask_value
-        ]).ok()?;
+            "attention_mask" => attention_mask_value,
+            "token_type_ids" => token_type_ids_value
+        ]) {
+            Ok(outputs) => {
+                println!("DEBUG: ONNX inference successful!");
+                outputs
+            }
+            Err(e) => {
+                println!("DEBUG: ONNX inference failed with error: {}", e);
+                return None;
+            }
+        };
+        
+        // DEBUG: Print available output names
+        println!("DEBUG: Available model outputs: {:?}", outputs.keys().collect::<Vec<_>>());
         
         // For sentence transformers, we need to extract the pooled output
-        // The exact output name might be different, so try common names
+        // Let's try to get the first output if the specific names don't work
         let output_names = ["last_hidden_state", "pooler_output", "sentence_embedding"];
         
         for output_name in &output_names {
             if let Ok(tensor) = outputs[*output_name].try_extract_tensor::<f32>() {
+                println!("DEBUG: Using output name: {}", output_name);
                 let (shape, data) = tensor;
+                println!("DEBUG: Output shape: {:?}", shape);
                 
                 // For sentence transformers, we typically do mean pooling
                 // The shape is usually [batch_size, sequence_length, hidden_size]
@@ -230,6 +260,71 @@ impl ONNXClassifier {
                     } else {
                         return Some(embedding_array);
                     }
+                }
+            }
+        }
+        
+        // If named outputs don't work, try to use the first available output
+        if outputs.len() > 0 {
+            // Try to get the first output
+            let output_key = outputs.keys().next().unwrap();
+            println!("DEBUG: Trying first available output: {}", output_key);
+            if let Ok(tensor) = outputs[output_key].try_extract_tensor::<f32>() {
+                let (shape, data) = tensor;
+                println!("DEBUG: First output shape: {:?}, data len: {}", shape, data.len());
+                
+                // Handle different potential shapes more flexibly
+                match shape.len() {
+                    3 => {
+                        // [batch_size, sequence_length, hidden_size]
+                        if shape[0] == batch_size as i64 {
+                            let seq_len = shape[1] as usize;
+                            let hidden_size = shape[2] as usize;
+                            
+                            let mut pooled = vec![0.0f32; hidden_size];
+                            
+                            for i in 0..seq_len {
+                                for j in 0..hidden_size {
+                                    let idx = i * hidden_size + j;
+                                    if idx < data.len() {
+                                        pooled[j] += data[idx];
+                                    }
+                                }
+                            }
+                            
+                            // Average by sequence length
+                            for val in pooled.iter_mut() {
+                                *val /= seq_len as f32;
+                            }
+                            
+                            // Normalize the embedding
+                            let norm: f32 = pooled.iter().map(|x| x * x).sum::<f32>().sqrt();
+                            if norm > 0.0 {
+                                for val in pooled.iter_mut() {
+                                    *val /= norm;
+                                }
+                            }
+                            
+                            return Some(Array1::from_vec(pooled));
+                        }
+                    }
+                    2 => {
+                        // [batch_size, hidden_size]
+                        if shape[0] == batch_size as i64 {
+                            let hidden_size = shape[1] as usize;
+                            let embedding = data[0..hidden_size].to_vec();
+                            let embedding_array = Array1::from_vec(embedding);
+                            
+                            // Normalize
+                            let norm = (embedding_array.mapv(|x| x * x).sum()).sqrt();
+                            if norm > 0.0 {
+                                return Some(embedding_array / norm);
+                            } else {
+                                return Some(embedding_array);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
